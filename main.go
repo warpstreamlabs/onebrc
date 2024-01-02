@@ -24,29 +24,35 @@ func bytesToString(b []byte) string {
 	return unsafe.String(unsafe.SliceData(b), len(b))
 }
 
+// allocator maps string keys to uint32 "slots", which are unique integers
+// allocated from a counter. They are called slots because they map to space in
+// the accumulator below.
 type allocator struct {
-	next    uint16
-	storage map[string]uint16
+	next    uint32
+	storage map[string]uint32
 }
 
 func newAllocator() *allocator {
 	return &allocator{
-		storage: map[string]uint16{},
+		storage: map[string]uint32{},
 	}
 }
 
-func (k *allocator) alloc(s string) uint16 {
+func (k *allocator) alloc(s string) uint32 {
 	slot, ok := k.storage[s]
 	if !ok {
 		safeKey := string(append([]byte(nil), s...))
 		k.storage[safeKey] = k.next
 		slot = k.next
+
+		// I guess we'll just have to live with not checking for overflow here.
 		k.next++
 	}
 
 	return slot
 }
 
+// accumulator stores the intermediate state for aggregates
 type accumulator struct {
 	max      []float32
 	min      []float32
@@ -65,7 +71,9 @@ func newAccumulator() *accumulator {
 	}
 }
 
-func (a *accumulator) ensure(slot uint16) {
+// ensure checks that there is enough space in the accumulator the requested
+// slot and reallocs the aggregate storage slices if not.
+func (a *accumulator) ensure(slot uint32) {
 	if len(a.occupied)-1 > int(slot) {
 		return
 	}
@@ -91,6 +99,8 @@ func (a *accumulator) ensure(slot uint16) {
 	a.occupied = newOccupied
 }
 
+// task wraps an input, allocator, and accumulator to run our hard-coded query
+// over a subset of the input.
 type task struct {
 	alloc *allocator
 	accum *accumulator
@@ -114,6 +124,12 @@ func (t *task) run() {
 			end  int
 		)
 
+		// Start from the end of the line for what I hope is a mild performance
+		// win. I didn't actually benchmark this, but we're only searching for
+		// a few characters from the end of the line.
+		//
+		// I could cheat by starting from the end of the line minus 7 to do
+		// fewer iterations in the common case...
 		for i := len(line) - 1; i > 0; i-- {
 			if line[i] == ';' {
 				end = i + 1
@@ -155,6 +171,8 @@ func (t *task) run() {
 	assert(scanner.Err())
 }
 
+// merge takes the intermediate results of the other task `ot` and merges it
+// with the intermediate results of this task `t`.
 func (t *task) merge(ot *task) {
 	for key, os := range ot.alloc.storage {
 		ts := t.alloc.alloc(key)
@@ -211,6 +229,9 @@ func splitIntoTasks(path string, taskCount int) []*task {
 
 		scanner := bufio.NewScanner(bufio.NewReader(f))
 		scanner.Split(bufio.ScanBytes)
+
+		// We have to keep scanning from `targetEnd` to the end of the next
+		// full record.
 		for scanner.Scan() {
 			targetEnd++
 			if scanner.Bytes()[0] == '\n' {
@@ -235,6 +256,7 @@ func splitIntoTasks(path string, taskCount int) []*task {
 		assert(err)
 
 		sr := io.NewSectionReader(f, s.begin, s.end-s.begin)
+		// buffer size chosen somewhat arbitrarily but it is reasonable
 		br := bufio.NewReaderSize(sr, 1<<19)
 
 		tasks = append(tasks, newTask(br))
